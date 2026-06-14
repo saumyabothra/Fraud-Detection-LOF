@@ -1,0 +1,463 @@
+---
+title: "VLK Fraud Detection — Local Outlier Factor"
+author: "Team"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+---
+
+# 1. Load Libraries
+
+```{r libraries}
+# Install any missing packages before running:
+# install.packages(c("tidyverse", "dbscan", "scales", "ggcorrplot", "uwot", "patchwork"))
+
+library(tidyverse)    # data wrangling + ggplot2
+library(dbscan)       # Local Outlier Factor (lof)
+library(scales)       # axis formatting
+library(ggcorrplot)   # correlation heatmap
+library(uwot)         # UMAP dimensionality reduction
+library(patchwork)    # combine ggplots
+```
+
+---
+
+# 2. Load Data
+
+```{r load-data}
+df_raw <- read_csv("vlk_fraud 1.csv", show_col_types = FALSE)
+
+cat("Rows:   ", nrow(df_raw), "\n")
+cat("Cols:   ", ncol(df_raw), "\n")
+cat("NAs:    ", sum(is.na(df_raw)), "\n")
+
+head(df_raw)
+```
+
+```{r column-types}
+glimpse(df_raw)
+```
+
+## 2.1 Filter Low-Value Transactions
+
+We remove any transactions with an Amount of €0.99 or below. These sub-euro transactions are unlikely to represent meaningful fraudulent activity and add noise to the model.
+
+```{r filter-low-value}
+n_before <- nrow(df_raw)
+
+df_raw <- df_raw %>%
+  filter(Amount > 0.99)
+
+n_after  <- nrow(df_raw)
+
+cat("Removed:", n_before - n_after, "transactions (Amount ≤ €0.99)\n")
+cat("Remaining:", n_after, "transactions\n")
+```
+
+---
+
+# 3. Exploratory Data Analysis
+
+## 3.1 Transaction Amount Distribution
+
+```{r amount-dist}
+ggplot(df_raw, aes(x = Amount)) +
+  geom_histogram(bins = 100, fill = "#2c7bb6", color = "white", alpha = 0.85) +
+  scale_x_log10(labels = dollar_format(prefix = "€")) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Distribution of Transaction Amount (log scale)",
+    x     = "Amount (€, log scale)",
+    y     = "Count"
+  ) +
+  theme_minimal(base_size = 13)
+
+ggplot(df_raw, aes(x = Amount)) +
+  geom_histogram(bins = 100, fill = "#2c7bb6", color = "white", alpha = 0.85) +
+  scale_x_continuous(labels = dollar_format(prefix = "€")) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Distribution of Transaction Amount",
+    x     = "Amount (€)",
+    y     = "Count"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+```{r amount-summary}
+summary(df_raw$Amount)
+```
+
+## 3.2 Feature Distributions (X01–X28)
+
+Plotting the median and IQR for each feature to spot any that are extreme.
+
+```{r feature-summary}
+feature_cols <- paste0("X", sprintf("%02d", 1:28))
+
+df_raw %>%
+  select(all_of(feature_cols)) %>%
+  pivot_longer(everything(), names_to = "feature", values_to = "value") %>%
+  group_by(feature) %>%
+  summarise(
+    mean   = mean(value),
+    sd     = sd(value),
+    min    = min(value),
+    max    = max(value),
+    .groups = "drop"
+  ) %>%
+  arrange(feature)
+```
+
+```{r feature-boxplots}
+df_raw %>%
+  select(all_of(feature_cols)) %>%
+  pivot_longer(everything(), names_to = "feature", values_to = "value") %>%
+  ggplot(aes(x = feature, y = value)) +
+  geom_boxplot(fill = "#abd9e9", outlier.size = 0.3, outlier.alpha = 0.3) +
+  coord_flip() +
+  labs(
+    title = "Feature Distributions (X01–X28)",
+    x     = NULL,
+    y     = "Value"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+## 3.3 Correlation Heatmap
+
+Since the features are already PCA-transformed, correlations should be low — but worth confirming.
+
+```{r correlation}
+cor_mat <- df_raw %>%
+  select(all_of(feature_cols)) %>%
+  cor()
+
+ggcorrplot(cor_mat,
+           type    = "lower",
+           lab     = FALSE,
+           colors  = c("#d7191c", "white", "#2c7bb6"),
+           title   = "Feature Correlation Matrix") +
+  theme(axis.text = element_text(size = 7))
+```
+
+---
+
+# 4. Feature Engineering
+
+The 28 features are already standardized (output of PCA). We only need to normalize `Amount` to the same scale before running LOF.
+
+```{r feature-engineering}
+df_model <- df_raw %>%
+  mutate(Amount_scaled = as.numeric(scale(Amount))) %>%
+  select(all_of(feature_cols), Amount_scaled)
+
+cat("Feature matrix shape:", nrow(df_model), "x", ncol(df_model), "\n")
+```
+
+---
+
+# 5. Local Outlier Factor (LOF)
+
+## 5.1 What is LOF?
+
+LOF compares the local density of a point to the densities of its neighbours. A score near 1 means the point is in a region of similar density (normal). A score **>> 1** means the point is much less dense than its neighbours — an outlier/anomaly.
+
+## 5.2 Choosing k (number of neighbours)
+
+A common heuristic for large datasets is k = 20. We'll also test k = 10 and k = 50 to assess sensitivity.
+
+```{r lof-run}
+set.seed(42)
+feature_matrix <- as.matrix(df_model)
+
+cat("Running LOF with k = 20 ...\n")
+lof_k20 <- lof(feature_matrix, minPts = 20)
+
+cat("Running LOF with k = 10 ...\n")
+lof_k10 <- lof(feature_matrix, minPts = 10)
+
+cat("Running LOF with k = 50 ...\n")
+lof_k50 <- lof(feature_matrix, minPts = 50)
+
+cat("Done.\n")
+```
+
+## 5.3 Score Distribution
+
+```{r lof-score-dist}
+score_df <- tibble(
+  Transaction_ID = df_raw$Transaction_ID,
+  Amount         = df_raw$Amount,
+  lof_k10        = lof_k10,
+  lof_k20        = lof_k20,
+  lof_k50        = lof_k50
+)
+
+score_df %>%
+  pivot_longer(starts_with("lof"), names_to = "k", values_to = "score") %>%
+  ggplot(aes(x = score, fill = k)) +
+  geom_histogram(bins = 100, alpha = 0.7, position = "identity") +
+  scale_x_log10() +
+  scale_y_continuous(labels = comma) +
+  scale_fill_manual(values = c("#d7191c", "#2c7bb6", "#1a9641"),
+                    labels = c("k=10", "k=20", "k=50")) +
+  labs(
+    title = "LOF Score Distribution (log scale)",
+    x     = "LOF Score (log scale)",
+    y     = "Count",
+    fill  = NULL
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## 5.4 Score Correlation Across k Values
+
+```{r lof-correlation}
+score_df %>%
+  select(starts_with("lof")) %>%
+  cor() %>%
+  round(4)
+```
+
+---
+
+# 6. Ensemble Score & Ranking
+
+We combine scores from k=10, 20, 50 using **rank averaging** — this is more robust than averaging raw scores directly (which can be dominated by extreme values).
+
+```{r ensemble}
+score_df <- score_df %>%
+  mutate(
+    rank_k10 = rank(lof_k10),
+    rank_k20 = rank(lof_k20),
+    rank_k50 = rank(lof_k50),
+    ensemble_rank_score = (rank_k10 + rank_k20 + rank_k50) / 3
+  ) %>%
+  arrange(desc(ensemble_rank_score))
+
+# Final ranked output
+ranked_df <- score_df %>%
+  mutate(Rank = row_number()) %>%
+  select(Rank, Transaction_ID, Amount, lof_k20, ensemble_rank_score)
+
+head(ranked_df, 20)
+```
+
+---
+
+# 7. Top 100 Suspicious Transactions
+
+```{r top-100}
+top100 <- ranked_df %>%
+  slice_head(n = 100)
+
+cat("Top 100 transactions selected.\n")
+cat("LOF k=20 score range:", round(min(top100$lof_k20), 2), "–", round(max(top100$lof_k20), 2), "\n")
+cat("Amount range: €", round(min(top100$Amount), 2), "–", round(max(top100$Amount), 2), "\n")
+```
+
+```{r top100-amount-dist}
+ggplot(top100, aes(x = Amount)) +
+  geom_histogram(bins = 30, fill = "#d7191c", color = "white", alpha = 0.85) +
+  scale_x_continuous(labels = dollar_format(prefix = "€")) +
+  labs(
+    title = "Amount Distribution — Top 100 Flagged Transactions",
+    x     = "Amount (€)",
+    y     = "Count"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+```{r top100-score-dist}
+ggplot(top100, aes(x = Rank, y = lof_k20)) +
+  geom_col(fill = "#d7191c", alpha = 0.8) +
+  labs(
+    title = "LOF Scores for Top 100 Flagged Transactions",
+    x     = "Rank",
+    y     = "LOF Score (k=20)"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+# 8. Visualisation — UMAP Projection
+
+We project all transactions to 2D with UMAP, then highlight the top 100 flagged transactions.
+
+> **Note:** UMAP on 284k rows takes a few minutes. Set `n_threads` higher if your machine supports it.
+
+```{r umap, cache=TRUE}
+set.seed(42)
+cat("Running UMAP (this may take a few minutes)...\n")
+
+umap_result <- umap(
+  feature_matrix,
+  n_neighbors   = 15,
+  min_dist      = 0.1,
+  n_threads     = 4,
+  verbose       = FALSE
+)
+
+umap_df <- tibble(
+  Transaction_ID = df_raw$Transaction_ID,
+  UMAP1          = umap_result[, 1],
+  UMAP2          = umap_result[, 2]
+) %>%
+  left_join(score_df %>% select(Transaction_ID, ensemble_rank_score), by = "Transaction_ID") %>%
+  mutate(
+    flagged = Transaction_ID %in% top100$Transaction_ID,
+    group   = if_else(flagged, "Top 100 Flagged", "Normal")
+  )
+
+cat("UMAP done.\n")
+```
+
+```{r umap-plot}
+# Plot normal transactions first, flagged on top
+p_umap <- ggplot() +
+  geom_point(
+    data  = filter(umap_df, !flagged),
+    aes(x = UMAP1, y = UMAP2),
+    color = "#aec6cf", size = 0.2, alpha = 0.3
+  ) +
+  geom_point(
+    data  = filter(umap_df, flagged),
+    aes(x = UMAP1, y = UMAP2),
+    color = "#d7191c", size = 2.5, alpha = 0.9
+  ) +
+  labs(
+    title    = "UMAP Projection — All Transactions",
+    subtitle = "Red = Top 100 Flagged by LOF | Grey = Normal",
+    x        = "UMAP Dimension 1",
+    y        = "UMAP Dimension 2"
+  ) +
+  theme_minimal(base_size = 13)
+
+p_umap
+```
+
+## 8.1 Zoom: LOF Score Coloured
+
+```{r umap-score-colour}
+# Sample 10,000 normal transactions to keep the plot readable
+set.seed(42)
+normal_sample <- umap_df %>% filter(!flagged) %>% slice_sample(n = 10000)
+
+ggplot() +
+  geom_point(
+    data = normal_sample,
+    aes(x = UMAP1, y = UMAP2, color = ensemble_rank_score),
+    size = 0.5, alpha = 0.5
+  ) +
+  geom_point(
+    data  = filter(umap_df, flagged),
+    aes(x = UMAP1, y = UMAP2),
+    color = "#d7191c", size = 2.5
+  ) +
+  scale_color_gradient(low = "#abd9e9", high = "#313695") +
+  labs(
+    title    = "UMAP — Anomaly Score Intensity",
+    subtitle = "Red points = Top 100 | Colour = ensemble LOF rank score",
+    color    = "Ensemble\nRank Score",
+    x        = "UMAP Dimension 1",
+    y        = "UMAP Dimension 2"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+# 9. Feature Analysis of Top 100
+
+Compare the mean feature values of the top 100 vs. the rest of the dataset to understand *what makes them anomalous*.
+
+```{r feature-comparison}
+flagged_ids <- top100$Transaction_ID
+
+comparison_df <- df_raw %>%
+  mutate(group = if_else(Transaction_ID %in% flagged_ids, "Flagged Top 100", "Normal")) %>%
+  select(group, all_of(feature_cols), Amount) %>%
+  pivot_longer(-group, names_to = "feature", values_to = "value") %>%
+  group_by(group, feature) %>%
+  summarise(mean_val = mean(value), .groups = "drop") %>%
+  pivot_wider(names_from = group, values_from = mean_val) %>%
+  mutate(difference = `Flagged Top 100` - Normal) %>%
+  arrange(desc(abs(difference)))
+
+comparison_df
+```
+
+```{r feature-diff-plot}
+comparison_df %>%
+  slice_head(n = 15) %>%
+  ggplot(aes(x = reorder(feature, abs(difference)), y = difference,
+             fill = difference > 0)) +
+  geom_col(alpha = 0.85) +
+  coord_flip() +
+  scale_fill_manual(values = c("#d7191c", "#2c7bb6"),
+                    labels = c("Below normal mean", "Above normal mean")) +
+  labs(
+    title = "Top 15 Features: Mean Difference (Flagged vs. Normal)",
+    x     = NULL,
+    y     = "Mean Difference",
+    fill  = NULL
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+# 10. Export Submission CSV
+
+```{r export}
+submission <- top100 %>%
+  select(Rank, Transaction_ID, Amount)
+
+write_csv(submission, "LOFRANKED>.csv")
+
+cat("Submission saved: LOFRANKED>.csv\n")
+cat("Rows:", nrow(submission), "\n")
+head(submission, 10)
+```
+
+---
+
+# 11. Summary
+
+```{r summary-table}
+tibble(
+  Step        = c("Dataset size", "Features used", "LOF k values tested",
+                  "Final model", "Transactions flagged",
+                  "LOF score (k=20) range of top 100"),
+  Detail      = c(
+    paste(nrow(df_raw), "transactions"),
+    "X01–X28 + Amount (scaled)",
+    "k = 10, 20, 50",
+    "Ensemble rank average of k=10, 20, 50",
+    "100",
+    paste0(round(min(top100$lof_k20), 2), " – ", round(max(top100$lof_k20), 2))
+  )
+) %>%
+  knitr::kable(col.names = c("Item", "Detail"), align = "ll")
+```
+
+> **Next steps:** Replace `team_<your-team-name>.csv` with your actual team name before submitting. Check the `/submission/` example in the repo to confirm column formatting matches.

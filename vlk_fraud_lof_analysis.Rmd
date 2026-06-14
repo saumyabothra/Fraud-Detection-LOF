@@ -26,15 +26,12 @@ knitr::opts_chunk$set(
 # 1. Load Libraries
 
 ```{r libraries}
-# Install any missing packages before running:
-# install.packages(c("tidyverse", "dbscan", "scales", "ggcorrplot", "uwot", "patchwork"))
-
-library(tidyverse)    # data wrangling + ggplot2
-library(dbscan)       # Local Outlier Factor (lof)
-library(scales)       # axis formatting
-library(ggcorrplot)   # correlation heatmap
-library(uwot)         # UMAP dimensionality reduction
-library(patchwork)    # combine ggplots
+library(tidyverse)    
+library(dbscan)       
+library(scales)       
+library(ggcorrplot)   
+library(uwot)         
+library(patchwork)    
 ```
 
 ---
@@ -303,8 +300,6 @@ ggplot(top100, aes(x = Rank, y = lof_k20)) +
 
 We project all transactions to 2D with UMAP, then highlight the top 100 flagged transactions.
 
-> **Note:** UMAP on 284k rows takes a few minutes. Set `n_threads` higher if your machine supports it.
-
 ```{r umap, cache=TRUE}
 set.seed(42)
 cat("Running UMAP (this may take a few minutes)...\n")
@@ -358,7 +353,6 @@ p_umap
 ## 8.1 Zoom: LOF Score Coloured
 
 ```{r umap-score-colour}
-# Sample 10,000 normal transactions to keep the plot readable
 set.seed(42)
 normal_sample <- umap_df %>% filter(!flagged) %>% slice_sample(n = 10000)
 
@@ -387,8 +381,6 @@ ggplot() +
 ---
 
 # 9. Feature Analysis of Top 100
-
-Compare the mean feature values of the top 100 vs. the rest of the dataset to understand *what makes them anomalous*.
 
 ```{r feature-comparison}
 flagged_ids <- top100$Transaction_ID
@@ -459,5 +451,3 @@ tibble(
 ) %>%
   knitr::kable(col.names = c("Item", "Detail"), align = "ll")
 ```
-
-> **Next steps:** Replace `team_<your-team-name>.csv` with your actual team name before submitting. Check the `/submission/` example in the repo to confirm column formatting matches.
